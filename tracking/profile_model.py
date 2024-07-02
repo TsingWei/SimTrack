@@ -1,15 +1,29 @@
+import os
+import sys
+
+prj_path = os.path.join(os.path.dirname(__file__), '..')
+if prj_path not in sys.path:
+    sys.path.append(prj_path)
+
 import argparse
 import torch
-import _init_paths
-from lib.utils.merge import merge_template_search
-# from lib.config.stark_s.config import cfg, update_config_from_file
-# from lib.models.stark.stark_s import build_starks
 from lib.utils.misc import NestedTensor
 from thop import profile
 from thop.utils import clever_format
 import time
 import importlib
-from torch import nn
+from thop.vision.basic_hooks import count_linear
+import thop
+from torch.nn import Linear
+import copy
+from torch.profiler import profile as t_profile, record_function, ProfilerActivity
+# Register the hook for Linear layers
+
+import os
+os.environ["http_proxy"] = "http://10.21.61.124:10809"
+os.environ["https_proxy"] = "https://10.21.61.124:10809"
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
 
 
 def parse_args():
@@ -18,75 +32,76 @@ def parse_args():
     """
     parser = argparse.ArgumentParser(description='Parse args for training')
     # for train
-    parser.add_argument('--script', type=str, default='stark_st2', choices=['stark_s', 'stark_st2'],
+    parser.add_argument('--script', type=str, default='simtrack', choices=['ostrack'],
                         help='training script name')
-    parser.add_argument('--config', type=str, default='baseline_R101', help='yaml configure file name')
+    parser.add_argument('--config', type=str, default='baseline', help='yaml configure file name')
     args = parser.parse_args()
 
     return args
 
 
-def get_complexity_MHA(m:nn.MultiheadAttention, x, y):
-    """(L, B, D): sequence length, batch size, dimension"""
-    d_mid = m.embed_dim
-    query, key, value = x[0], x[1], x[2]
-    Lq, batch, d_inp = query.size()
-    Lk = key.size(0)
-    """compute flops"""
-    total_ops = 0
-    # projection of Q, K, V
-    total_ops += d_inp * d_mid * Lq * batch  # query
-    total_ops += d_inp * d_mid * Lk * batch * 2  # key and value
-    # compute attention
-    total_ops += Lq * Lk * d_mid * 2
-    m.total_ops += torch.DoubleTensor([int(total_ops)])
-
-
-def evaluate(model, search, seq_dict, run_box_head, run_cls_head):
-    """Compute FLOPs, Params, and Speed"""
-    custom_ops = {nn.MultiheadAttention: get_complexity_MHA}
-    # # backbone
-    macs1, params1 = profile(model, inputs=(search, None, "backbone", False, False),
-                             custom_ops=None, verbose=False)
-    macs, params = clever_format([macs1, params1], "%.3f")
-    print('backbone (search) macs is ', macs)
-    print('backbone params is ', params)
-    # transformer and head
-    macs2, params2 = profile(model, inputs=(None, seq_dict, "transformer", True, True),
-                             custom_ops=custom_ops, verbose=False)
-    macs, params = clever_format([macs2, params2], "%.3f")
-    print('transformer and head macs is ', macs)
-    print('transformer and head params is ', params)
-    # the whole model
-    macs, params = clever_format([macs1 + macs2, params1 + params2], "%.3f")
-    print('overall macs is ', macs)
-    print('overall params is ', params)
-
+def evaluate_vit(model, template, search, template_bb):
     '''Speed Test'''
-    T_w = 10
-    T_t = 100
+    model_ = copy.deepcopy(model)
+    
+    # macs1, params1 = profile(model, inputs=(template, search, template_bb),
+    #                          custom_ops=None, verbose=False)
+    # macs, params = clever_format([macs1, params1], "%.3f")
+    # print('overall macs is ', macs)
+    # print('overall params is ', params)
+    
+    T_w = 500
+    T_t = 1000
     print("testing speed ...")
+    torch.cuda.synchronize()
     with torch.no_grad():
         # overall
         for i in range(T_w):
-            _ = model(search, None, "backbone", run_box_head, run_cls_head)
-            _ = model(None, seq_dict, "transformer", run_box_head, run_cls_head)
+            x_dict = model_.forward_backbone([template, search, template_bb])
+            _ = model_.forward_head(seq_dict=[x_dict], run_box_head=True)
         start = time.time()
         for i in range(T_t):
-            _ = model(search, None, "backbone", run_box_head, run_cls_head)
-            _ = model(None, seq_dict, "transformer", run_box_head, run_cls_head)
+            x_dict = model_.forward_backbone([template, search, template_bb])
+            _ = model_.forward_head(seq_dict=[x_dict], run_box_head=True)
+        torch.cuda.synchronize()
         end = time.time()
         avg_lat = (end - start) / T_t
         print("The average overall latency is %.2f ms" % (avg_lat * 1000))
-        # backbone
+        print("FPS is %.2f fps" % (1. / avg_lat))
+        # for i in range(T_w):
+        #     _ = model(template, search)
+        # start = time.time()
+        # for i in range(T_t):
+        #     _ = model(template, search)
+        # end = time.time()
+        # avg_lat = (end - start) / T_t
+        # print("The average backbone latency is %.2f ms" % (avg_lat * 1000))
+    # with t_profile(activities=[
+    #     ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+    #     with record_function("model_inference"):
+    #         model_(template, search)
+    # print(prof.key_averages(group_by_stack_n=5).table(sort_by="cpu_time_total", row_limit=100))
+
+
+def evaluate_vit_separate(model, template, search):
+    '''Speed Test'''
+    T_w = 50
+    T_t = 1000
+    print("testing speed ...")
+    z = model.forward_backbone(template, image_type='template')
+    x = model.forward_backbone(search, image_type='search')
+    with torch.no_grad():
+        # overall
         for i in range(T_w):
-            _ = model(search, None, "backbone", run_box_head, run_cls_head)
+            _ = model.forward_backbone(search, image_type='search')
+            _ = model.forward_cat(z, x)
         start = time.time()
         for i in range(T_t):
-            _ = model(search, None, "backbone", run_box_head, run_cls_head)
+            _ = model.forward_backbone(search, image_type='search')
+            _ = model.forward_cat(z, x)
         end = time.time()
         avg_lat = (end - start) / T_t
-        print("The average backbone latency is %.2f ms" % (avg_lat * 1000))
+        print("The average overall latency is %.2f ms" % (avg_lat * 1000))
 
 
 def get_data(bs, sz):
@@ -107,43 +122,29 @@ if __name__ == "__main__":
     config_module.update_config_from_file(yaml_fname)
     '''set some values'''
     bs = 1
-    z_sz = cfg.TEST.TEMPLATE_SIZE
-    x_sz = cfg.TEST.SEARCH_SIZE
-    h_dim = cfg.MODEL.HIDDEN_DIM
-    '''import stark network module'''
-    model_module = importlib.import_module('lib.models.stark')
-    if args.script == "stark_s":
-        model_constructor = model_module.build_starks
+    z_sz = cfg.DATA.TEMPLATE.SIZE
+    x_sz = cfg.DATA.SEARCH.SIZE
+
+    if args.script == "simtrack":
+        model_module = importlib.import_module('lib.models')
+        model_constructor = model_module.build_simtrack
         model = model_constructor(cfg)
         # get the template and search
-        template = get_data(bs, z_sz)
-        search = get_data(bs, x_sz)
+        template = torch.randn(bs, 3, z_sz, z_sz)
+        template_bb = torch.tensor([[0.5,0.5,0.5,0.5]])
+    
+        # template = torch.randn(bs, 64, 768)
+        search = torch.randn(bs, 3, x_sz, x_sz)
         # transfer to device
         model = model.to(device)
+        model.eval()
         template = template.to(device)
         search = search.to(device)
-        # forward template and search
-        oup_t = model.forward_backbone(template)
-        oup_s = model.forward_backbone(search)
-        seq_dict = merge_template_search([oup_t, oup_s])
-        # evaluate the model properties
-        evaluate(model, search, seq_dict, run_box_head=True, run_cls_head=False)
-    elif args.script == "stark_st2":
-        model_constructor = model_module.build_starkst
-        model = model_constructor(cfg)
-        # get the template and search
-        template1 = get_data(bs, z_sz)
-        template2 = get_data(bs, z_sz)
-        search = get_data(bs, x_sz)
-        # transfer to device
-        model = model.to(device)
-        template1 = template1.to(device)
-        template2 = template2.to(device)
-        search = search.to(device)
-        # forward template and search
-        oup_t1 = model.forward_backbone(template1)
-        oup_t2 = model.forward_backbone(template2)
-        oup_s = model.forward_backbone(search)
-        seq_dict = merge_template_search([oup_t1, oup_t2, oup_s])
-        # evaluate the model properties
-        evaluate(model, search, seq_dict, run_box_head=True, run_cls_head=True)
+        template_bb = template_bb.to(device)
+
+        # merge_layer = cfg.MODEL.BACKBONE.MERGE_LAYER
+
+        evaluate_vit(model, template, search, template_bb)
+
+    else:
+        raise NotImplementedError
